@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
 
 using Microsoft.Extensions.Logging;
@@ -15,10 +16,22 @@ internal class DiscordClient : IDiscordClient, IDisposable
   private readonly IHttpClientFactory _httpClientFactory;
   private readonly IWebSocketFactory _webSocketFactory;
   private readonly ILogger<DiscordClient> _logger;
+  private readonly JsonSerializerOptions _jsonSerializerOptions = new()
+  {
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    Converters =
+    {
+      new DiscordEventConverter(),
+    },
+  };
 
   private string _gatewayUrl = string.Empty;
   private IWebSocket? _webSocket;
   private Task? _receiveTask;
+  private DateTime _timeLastHeartbeatSent = DateTime.MinValue;
+  private DateTime _timeLastHeartbeatAcknowledged = DateTime.MinValue;
+  private CancellationTokenSource? _heartbeatCts;
+  private Task? _heartbeatTask;
 
   public DiscordClient(
     DiscordClientOptions options,
@@ -85,7 +98,11 @@ internal class DiscordClient : IDiscordClient, IDisposable
 
         memoryStream.Seek(0, SeekOrigin.Begin);
 
-        var e = await JsonSerializer.DeserializeAsync<DiscordEvent>(memoryStream, cancellationToken: cancellationToken);
+        var e = await JsonSerializer.DeserializeAsync<DiscordEvent>(
+          memoryStream,
+          _jsonSerializerOptions,
+          cancellationToken
+        );
 
         if (e is null)
         {
@@ -114,9 +131,100 @@ internal class DiscordClient : IDiscordClient, IDisposable
 
   private Task HandleEventAsync(DiscordEvent e, CancellationToken cancellationToken)
   {
-    // TODO: Handle different event types
     _logger.LogInformation("Received event: {Event}", e);
+
+    if (e is HelloDiscordEvent he)
+    {
+      StartHeartbeat(he, cancellationToken);
+      // TODO: Send identify event
+      return Task.CompletedTask;
+    }
+
+    if (e is HeartbeatAckDiscordEvent hae)
+    {
+      _timeLastHeartbeatAcknowledged = DateTime.UtcNow;
+      _logger.LogInformation("Heartbeat acknowledged at {Time}", _timeLastHeartbeatAcknowledged);
+      return Task.CompletedTask;
+    }
+
     return Task.CompletedTask;
+  }
+
+  private void StartHeartbeat(HelloDiscordEvent helloEvent, CancellationToken cancellationToken)
+  {
+    _heartbeatCts?.Cancel();
+    _heartbeatCts?.Dispose();
+
+    _heartbeatCts = new CancellationTokenSource();
+    var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _heartbeatCts.Token);
+
+    _heartbeatTask = Task.Run(async () =>
+    {
+      _logger.LogInformation("Starting heartbeat task.");
+
+      while (_webSocket?.State is WebSocketState.Open && linkedCts.Token.IsCancellationRequested is false)
+      {
+        try
+        {
+
+          var jitter = Random.Shared.Next(0, 1);
+          await Task.Delay(helloEvent.Data.HeartbeatInterval + jitter);
+
+          // if (timeLastHeartbeatAcknowledged < timeLastHeartbeatSent)
+          // {
+          //   Console.WriteLine("Heartbeat not acknowledged, closing connection.");
+          //   await discordWebSocketClient.CloseAsync(WebSocketCloseStatus.ProtocolError, "Heartbeat not acknowledged", CancellationToken.None);
+          //   break;
+          // }
+          //
+          _timeLastHeartbeatSent = await SendHeartbeatAsync(helloEvent.Sequence, linkedCts.Token);
+
+          _logger.LogInformation("Heartbeat sent at {Time}", _timeLastHeartbeatSent);
+        }
+        catch (OperationCanceledException ex)
+        {
+          _logger.LogInformation(ex, "Heartbeat task canceled");
+        }
+        catch (Exception ex)
+        {
+          _logger.LogError(ex, "Error in heartbeat task: {Message}", ex.Message);
+          // TODO: Attempt to reconnect
+        }
+      }
+    }, linkedCts.Token);
+  }
+
+  private async Task<DateTime> SendHeartbeatAsync(int? sequence, CancellationToken cancellationToken)
+  {
+    var heartbeat = new HeartbeatEvent(sequence);
+    await SendJsonAsync(heartbeat, cancellationToken);
+    return DateTime.UtcNow;
+  }
+
+  private async Task SendJsonAsync(object data, CancellationToken cancellationToken)
+  {
+    if (_webSocket?.State is not WebSocketState.Open)
+    {
+      _logger.LogWarning("WebSocket is not open. Cannot send message.");
+      return;
+    }
+
+    try
+    {
+      var json = JsonSerializer.Serialize(data, _jsonSerializerOptions);
+      var bytes = Encoding.UTF8.GetBytes(json);
+      var buffer = new ArraySegment<byte>(bytes);
+      await _webSocket.SendAsync(buffer, WebSocketMessageType.Text, true, cancellationToken);
+    }
+    catch (OperationCanceledException ex)
+    {
+      _logger.LogInformation(ex, "Send operation canceled");
+    }
+    catch (Exception ex)
+    {
+      _logger.LogError(ex, "Failed to send message: {Message}", ex.Message);
+      throw new DiscordClientException("Failed to send message.", ex);
+    }
   }
 
   private async Task<string> GetGatewayUrlAsync(CancellationToken cancellationToken)
@@ -145,6 +253,9 @@ internal class DiscordClient : IDiscordClient, IDisposable
 
   public void Dispose()
   {
+    _heartbeatCts?.Cancel();
+    _heartbeatCts?.Dispose();
+    _heartbeatTask?.Dispose();
     _receiveTask?.Dispose();
     _webSocket?.Dispose();
   }
