@@ -19,6 +19,7 @@ var loggerFactory = LoggerFactory.Create(static builder =>
       IndentSize = 2,
     };
   });
+
   builder.SetMinimumLevel(LogLevel.Debug);
 });
 
