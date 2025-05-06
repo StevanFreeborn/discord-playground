@@ -1,10 +1,19 @@
 ﻿using System.Text.Json;
 
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+
+var config = new ConfigurationBuilder()
+  .AddJsonFile("appsettings.json", optional: false)
+  .Build();
+
+var section = config.GetSection(nameof(DiscordClientOptions));
 
 var options = new DiscordClientOptions()
 {
-  ApiUrl = "https://discord.com/api/v10",
+  ApiUrl = section.GetValue<string>("ApiUrl") ?? string.Empty,
+  AppToken = section.GetValue<string>("AppToken") ?? string.Empty,
+  Intents = section.GetValue<int>("Intents"),
 };
 
 var httpClientFactory = new HttpClientFactory();
