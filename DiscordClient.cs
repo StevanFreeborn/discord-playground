@@ -33,6 +33,10 @@ internal class DiscordClient : IDiscordClient, IDisposable
   private CancellationTokenSource? _heartbeatCts;
   private Task? _heartbeatTask;
 
+  // TODO: Need to add asynchronous lock to
+  // deal with synchronization of shared
+  // state between different threads
+
   public DiscordClient(
     DiscordClientOptions options,
     IHttpClientFactory httpClientFactory,
@@ -170,13 +174,16 @@ internal class DiscordClient : IDiscordClient, IDisposable
           var jitter = Random.Shared.Next(0, 1);
           await Task.Delay(helloEvent.Data.HeartbeatInterval + jitter);
 
-          // if (timeLastHeartbeatAcknowledged < timeLastHeartbeatSent)
-          // {
-          //   Console.WriteLine("Heartbeat not acknowledged, closing connection.");
-          //   await discordWebSocketClient.CloseAsync(WebSocketCloseStatus.ProtocolError, "Heartbeat not acknowledged", CancellationToken.None);
-          //   break;
-          // }
-          //
+          if (_timeLastHeartbeatAcknowledged < _timeLastHeartbeatSent)
+          {
+            if (_webSocket?.State is WebSocketState.Open)
+            {
+              _logger.LogWarning("Heartbeat not acknowledged. Closing WebSocket.");
+              await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Heartbeat not acknowledged", CancellationToken.None);
+            }
+            break;
+          }
+
           _timeLastHeartbeatSent = await SendHeartbeatAsync(helloEvent.Sequence, linkedCts.Token);
 
           _logger.LogInformation("Heartbeat sent at {Time}", _timeLastHeartbeatSent);

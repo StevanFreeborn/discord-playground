@@ -5,6 +5,7 @@ internal interface IWebSocket : IDisposable
   WebSocketState State { get; }
 
   Task ConnectAsync(Uri uri, CancellationToken cancellationToken);
+  Task CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken);
   Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken);
   Task SendAsync(ArraySegment<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken);
 }
@@ -23,6 +24,11 @@ internal class WebSocket : IWebSocket
   public async Task ConnectAsync(Uri uri, CancellationToken cancellationToken)
   {
     await _clientWebSocket.ConnectAsync(uri, cancellationToken);
+  }
+
+  public async Task CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken)
+  {
+    await _clientWebSocket.CloseAsync(closeStatus, statusDescription, cancellationToken);
   }
 
   public async Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken)
