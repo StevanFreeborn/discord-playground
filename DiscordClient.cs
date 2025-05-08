@@ -26,6 +26,7 @@ internal class DiscordClient : IDiscordClient, IDisposable
       new DiscordEventConverter(),
     },
   };
+  private readonly AsyncLock _lock = new();
 
   private string _gatewayUrl = string.Empty;
   private IWebSocket? _webSocket;
@@ -36,10 +37,6 @@ internal class DiscordClient : IDiscordClient, IDisposable
   private Task? _heartbeatTask;
   private string _sessionId = string.Empty;
   private string _resumeGatewayUrl = string.Empty;
-
-  // TODO: Need to add asynchronous lock to
-  // deal with synchronization of shared
-  // state between different threads
 
   public DiscordClient(
     DiscordClientOptions options,
@@ -56,19 +53,22 @@ internal class DiscordClient : IDiscordClient, IDisposable
 
   public async Task ConnectAsync(CancellationToken cancellationToken = default)
   {
-    if (string.IsNullOrEmpty(_gatewayUrl))
+    using (await _lock.LockAsync(cancellationToken))
     {
-      _gatewayUrl = await GetGatewayUrlAsync(cancellationToken);
+      if (string.IsNullOrEmpty(_gatewayUrl))
+      {
+        _gatewayUrl = await GetGatewayUrlAsync(cancellationToken);
+      }
+
+      _webSocket = _webSocketFactory.Create();
+
+      var uri = new Uri(_gatewayUrl);
+      await _webSocket.ConnectAsync(uri, cancellationToken);
+
+      _logger.LogInformation("Connected to Discord Gateway at {GatewayUrl}", _gatewayUrl);
+
+      _receiveTask = ReceiveMessagesAsync(cancellationToken);
     }
-
-    _webSocket = _webSocketFactory.Create();
-
-    var uri = new Uri(_gatewayUrl);
-    await _webSocket.ConnectAsync(uri, cancellationToken);
-
-    _logger.LogInformation("Connected to Discord Gateway at {GatewayUrl}", _gatewayUrl);
-
-    _receiveTask = ReceiveMessagesAsync(cancellationToken);
   }
 
   private async Task ReceiveMessagesAsync(CancellationToken cancellationToken)
@@ -77,8 +77,17 @@ internal class DiscordClient : IDiscordClient, IDisposable
     {
       var messageBuffer = new byte[8192];
 
-      while (_webSocket?.State == WebSocketState.Open && cancellationToken.IsCancellationRequested is false)
+      while (cancellationToken.IsCancellationRequested is false)
       {
+        using (await _lock.LockAsync(cancellationToken))
+        {
+          if (_webSocket?.State is not WebSocketState.Open)
+          {
+            _logger.LogWarning("WebSocket is not open. Cannot receive messages.");
+            return;
+          }
+        }
+
         // websocket message might be larger than the
         // size of the buffer so we need to loop until
         // we receive the end of the message and
@@ -151,22 +160,30 @@ internal class DiscordClient : IDiscordClient, IDisposable
   {
     if (e is HelloDiscordEvent he)
     {
-      StartHeartbeat(he, cancellationToken);
+      await StartHeartbeatAsync(he, cancellationToken);
       await IdentifyAsync(cancellationToken);
       return;
     }
 
     if (e is HeartbeatAckDiscordEvent hae)
     {
-      _timeLastHeartbeatAcknowledged = DateTime.UtcNow;
+      using (await _lock.LockAsync(cancellationToken))
+      {
+        _timeLastHeartbeatAcknowledged = DateTime.UtcNow;
+      }
+
       _logger.LogInformation("Heartbeat acknowledged at {Time}", _timeLastHeartbeatAcknowledged);
       return;
     }
 
     if (e is ReadyDiscordEvent re)
     {
-      _sessionId = re.Data.SessionId;
-      _resumeGatewayUrl = re.Data.ResumeGatewayUrl;
+      using (await _lock.LockAsync(cancellationToken))
+      {
+        _sessionId = re.Data.SessionId;
+        _resumeGatewayUrl = re.Data.ResumeGatewayUrl;
+      }
+
       _logger.LogInformation("Ready event received. Session ID: {SessionId}", re.Data.SessionId);
       return;
     }
@@ -181,51 +198,66 @@ internal class DiscordClient : IDiscordClient, IDisposable
     _logger.LogInformation("Identify event sent.");
   }
 
-  private void StartHeartbeat(HelloDiscordEvent helloEvent, CancellationToken cancellationToken)
+  private async Task StartHeartbeatAsync(HelloDiscordEvent helloEvent, CancellationToken cancellationToken)
   {
-    _heartbeatCts?.Cancel();
-    _heartbeatCts?.Dispose();
-
-    _heartbeatCts = new CancellationTokenSource();
-    var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _heartbeatCts.Token);
-
-    _heartbeatTask = Task.Run(async () =>
+    using (await _lock.LockAsync(cancellationToken))
     {
-      _logger.LogInformation("Starting heartbeat task.");
+      _heartbeatCts?.Cancel();
+      _heartbeatCts?.Dispose();
 
-      while (_webSocket?.State is WebSocketState.Open && linkedCts.Token.IsCancellationRequested is false)
+      _heartbeatCts = new CancellationTokenSource();
+      var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _heartbeatCts.Token);
+
+      _heartbeatTask = Task.Run(async () =>
       {
-        try
+        _logger.LogInformation("Starting heartbeat task.");
+
+        while (linkedCts.Token.IsCancellationRequested is false)
         {
-
-          var jitter = Random.Shared.Next(0, 1);
-          await Task.Delay(helloEvent.Data.HeartbeatInterval + jitter);
-
-          if (_timeLastHeartbeatAcknowledged < _timeLastHeartbeatSent)
+          using (await _lock.LockAsync(linkedCts.Token))
           {
-            if (_webSocket?.State is WebSocketState.Open)
+            if (_webSocket?.State is not WebSocketState.Open)
             {
-              _logger.LogWarning("Heartbeat not acknowledged. Closing WebSocket.");
-              await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Heartbeat not acknowledged", CancellationToken.None);
+              _logger.LogWarning("WebSocket is not open. Cannot send heartbeat.");
+              break;
             }
-            break;
           }
 
-          _timeLastHeartbeatSent = await SendHeartbeatAsync(helloEvent.Sequence, linkedCts.Token);
+          try
+          {
 
-          _logger.LogInformation("Heartbeat sent at {Time}", _timeLastHeartbeatSent);
+            var jitter = Random.Shared.Next(0, 1);
+            await Task.Delay(helloEvent.Data.HeartbeatInterval + jitter);
+
+            using (await _lock.LockAsync(linkedCts.Token))
+            {
+              if (_timeLastHeartbeatAcknowledged < _timeLastHeartbeatSent)
+              {
+                if (_webSocket?.State is WebSocketState.Open)
+                {
+                  _logger.LogWarning("Heartbeat not acknowledged. Closing WebSocket.");
+                  await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Heartbeat not acknowledged", CancellationToken.None);
+                }
+                break;
+              }
+
+              _timeLastHeartbeatSent = await SendHeartbeatAsync(helloEvent.Sequence, linkedCts.Token);
+            }
+
+            _logger.LogInformation("Heartbeat sent at {Time}", _timeLastHeartbeatSent);
+          }
+          catch (OperationCanceledException ex)
+          {
+            _logger.LogInformation(ex, "Heartbeat task canceled");
+          }
+          catch (Exception ex)
+          {
+            _logger.LogError(ex, "Error in heartbeat task: {Message}", ex.Message);
+            // TODO: Attempt to reconnect
+          }
         }
-        catch (OperationCanceledException ex)
-        {
-          _logger.LogInformation(ex, "Heartbeat task canceled");
-        }
-        catch (Exception ex)
-        {
-          _logger.LogError(ex, "Error in heartbeat task: {Message}", ex.Message);
-          // TODO: Attempt to reconnect
-        }
-      }
-    }, linkedCts.Token);
+      }, linkedCts.Token);
+    }
   }
 
   private async Task<DateTime> SendHeartbeatAsync(int? sequence, CancellationToken cancellationToken)
@@ -237,10 +269,13 @@ internal class DiscordClient : IDiscordClient, IDisposable
 
   private async Task SendJsonAsync(object data, CancellationToken cancellationToken)
   {
-    if (_webSocket?.State is not WebSocketState.Open)
+    using (await _lock.LockAsync(cancellationToken))
     {
-      _logger.LogWarning("WebSocket is not open. Cannot send message.");
-      return;
+      if (_webSocket?.State is not WebSocketState.Open)
+      {
+        _logger.LogWarning("WebSocket is not open. Cannot send message.");
+        return;
+      }
     }
 
     try
